@@ -70,6 +70,7 @@
 #define DEFAULT_ENCODE_NUMBER_PRECISION 14
 #define DEFAULT_DECODE_NULL_AS_NIL 0
 #define DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY 0 /* 0 table, 1 array */
+#define DEFAULT_ENCODE_USE_METAMETHOD 0
 
 #ifdef DISABLE_INVALID_NUMBERS
 #undef DEFAULT_DECODE_INVALID_NUMBERS
@@ -127,6 +128,8 @@ typedef struct {
     int encode_number_precision;
     int encode_keep_buffer;
     int encode_empty_table_as_array;
+    int encode_use_metamethod;
+    int encode_use_metamethod_next_ref;
 
     int decode_invalid_numbers;
     int decode_max_depth;
@@ -263,6 +266,26 @@ static int json_enum_option(lua_State *l, int optindex, int *setting,
     return 1;
 }
 
+static int json_function_option(lua_State *l, int optindex, int *setting, int narg)
+{
+	char errmsg[64];
+
+	if (!lua_isfunction(l, optindex)) {
+		snprintf(errmsg, sizeof(errmsg), "function expected, got %s", lua_typename(l, lua_type(l, optindex)));
+		luaL_argerror(l, narg, errmsg);
+	}
+
+	lua_pushvalue(l, optindex);
+	int ref = luaL_ref(l, LUA_REGISTRYINDEX);
+	if (ref == LUA_REFNIL || ref == LUA_NOREF) {
+		luaL_error(l, "register function error, nil/no reference");
+	}
+
+	*setting = ref;
+
+	return 1;
+}
+
 /* Configures handling of extremely sparse arrays:
  * convert: Convert extremely sparse arrays into objects? Otherwise error.
  * ratio: 0: always allow sparse; 1: never allow sparse; >1: use ratio
@@ -332,6 +355,19 @@ static int json_cfg_encode_empty_tables_as_array(lua_State *l)
     return json_enum_option(l, 1, &cfg->encode_empty_table_as_array, NULL, 1);
 }
 
+static int json_cfg_encode_use_metamethod(lua_State *l)
+{
+	json_config_t *cfg = json_arg_init(l, 2);
+
+	json_enum_option(l, 1, &cfg->encode_use_metamethod, NULL, 1);
+	json_function_option(l, 2, &cfg->encode_use_metamethod_next_ref, 2);
+	if (cfg->encode_use_metamethod_next_ref < 0) {
+		cfg->encode_use_metamethod = 0;
+	}
+
+	return 2;
+}
+
 #if defined(DISABLE_INVALID_NUMBERS) && !defined(USE_INTERNAL_FPCONV)
 void json_verify_invalid_number_setting(lua_State *l, int *setting)
 {
@@ -370,7 +406,6 @@ static int json_cfg_decode_invalid_numbers(lua_State *l)
 static int json_cfg_decode_null_as_nil(lua_State *l)
 {
     json_config_t *cfg = json_arg_init(l, 1);
-
     return json_enum_option(l, 1, &cfg->decode_null_as_nil, NULL, 1);
 }
 
@@ -410,6 +445,7 @@ static void json_create_config(lua_State *l)
     cfg->encode_number_precision = DEFAULT_ENCODE_NUMBER_PRECISION;
     cfg->decode_null_as_nil = DEFAULT_DECODE_NULL_AS_NIL;
     cfg->encode_empty_table_as_array = DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY;
+    cfg->encode_use_metamethod = DEFAULT_ENCODE_USE_METAMETHOD;
 
 #if DEFAULT_ENCODE_KEEP_BUFFER > 0
     strbuf_init(&cfg->encode_buf, 0);
@@ -459,6 +495,26 @@ static void json_create_config(lua_State *l)
     cfg->escape2char['f'] = '\f';
     cfg->escape2char['r'] = '\r';
     cfg->escape2char['u'] = 'u';          /* Unicode parsing required */
+}
+
+static int json_lua_next(lua_State *l, json_config_t *cfg, int index)
+{
+	if (cfg->encode_use_metamethod) {
+		/* get the custom 'next' function */
+		lua_rawgeti(l, LUA_REGISTRYINDEX, cfg->encode_use_metamethod_next_ref);
+		/* push the table arg */
+		lua_pushvalue(l, index);
+		/* k, v = next(t), 1 arg, 2 results */
+		lua_call(l, 1, 2);
+		/* if k is nil, pop all reaults and return 0 like lua_next() does */
+		if (lua_isnil(l, -2)) {
+			lua_pop(l, 2);
+			return 0;
+		}
+		return 1;
+	} else {
+		return lua_next(l, index);
+	}
 }
 
 /* ===== ENCODING ===== */
@@ -519,7 +575,8 @@ static int lua_array_length(lua_State *l, json_config_t *cfg, strbuf_t *json)
 
     lua_pushnil(l);
     /* table, startkey */
-    while (lua_next(l, -2) != 0) {
+    /*while (lua_next(l, -2) != 0) {*/
+    while (json_lua_next(l, cfg, -2) != 0) {
         /* table, key, value */
         if (lua_type(l, -2) == LUA_TNUMBER &&
             (k = lua_tonumber(l, -2))) {
@@ -595,7 +652,13 @@ static void json_append_array(lua_State *l, json_config_t *cfg, int current_dept
         else
             comma = 1;
 
-        lua_rawgeti(l, -1, i);
+        if (cfg->encode_use_metamethod) {
+        	lua_pushinteger(l, i);
+        	lua_gettable(l, -2);
+        } else {
+        	lua_rawgeti(l, -1, i);
+        }
+
         json_append_data(l, cfg, current_depth, json);
         lua_pop(l, 1);
     }
@@ -652,7 +715,8 @@ static void json_append_object(lua_State *l, json_config_t *cfg,
     lua_pushnil(l);
     /* table, startkey */
     comma = 0;
-    while (lua_next(l, -2) != 0) {
+    /*while (lua_next(l, -2) != 0) {*/
+    while (json_lua_next(l, cfg, -2) != 0) {
         if (comma)
             strbuf_append_char(json, ',');
         else
@@ -1385,6 +1449,7 @@ static int lua_cjson_new(lua_State *l)
         { "decode_invalid_numbers", json_cfg_decode_invalid_numbers },
         { "decode_null_as_nil", json_cfg_decode_null_as_nil },
         { "encode_empty_table_as_array", json_cfg_encode_empty_tables_as_array },
+        { "encode_use_metamethod", json_cfg_encode_use_metamethod },
         { "new", lua_cjson_new },
         { NULL, NULL }
     };

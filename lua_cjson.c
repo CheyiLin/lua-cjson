@@ -54,6 +54,11 @@
 #define CJSON_VERSION   "2.1devel"
 #endif
 
+#define CJSON_DEBUG		0
+#if CJSON_DEBUG
+#include <stdio.h>
+#endif
+
 /* Workaround for Solaris platforms missing isinf() */
 #if !defined(isinf) && (defined(USE_INTERNAL_ISINF) || defined(MISSING_ISINF))
 #define isinf(x) (!isnan(x) && isnan((x) - (x)))
@@ -194,6 +199,48 @@ static const char *char2escape[256] = {
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
 };
 
+#if CJSON_DEBUG
+static void lua_stack_dump(lua_State *l, const char *msg) {
+	int i;
+	int top = lua_gettop(l);
+
+	printf("-- %02d: %s" "\n", top, (msg != NULL) ? msg : "(no description)");
+
+	for (i = 1; i <= top; ++i) {
+		int type = lua_type(l, i);
+		switch (type) {
+			case LUA_TSTRING: {
+				printf("   -> [%02d] '%s'" "\n", i, lua_tostring(l, i));
+				break;
+			}
+			case LUA_TBOOLEAN: {
+				printf("   -> [%02d] %s" "\n", i, lua_toboolean(l, i) ? "true" : "false");
+				break;
+			}
+			case LUA_TNUMBER: {
+				printf("   -> [%02d] %g" "\n", i, lua_tonumber(l, i));
+				break;
+			}
+			case LUA_TTABLE: {
+				printf("   -> [%02d] table '%s'" "\n", i, lua_tostring(l, i));
+				break;
+			}
+			case LUA_TFUNCTION: {
+				lua_Debug dbg;
+				lua_getstack(l, i, &dbg);
+				lua_getinfo(l, "nS", &dbg);
+				printf("   -> [%02d] func '%s'" "\n", i, dbg.short_src);
+				break;
+			}
+			default: {
+				printf("   -> [%02d] %s" "\n", i, lua_typename(l, type));
+				break;
+			}
+		}
+	}
+}
+#endif
+
 /* ===== CONFIGURATION ===== */
 
 static json_config_t *json_fetch_config(lua_State *l)
@@ -268,7 +315,13 @@ static int json_enum_option(lua_State *l, int optindex, int *setting,
 
 static int json_function_option(lua_State *l, int optindex, int *setting, int narg)
 {
-	char errmsg[64];
+	char errmsg[64] = {0};
+	int ref = *setting;
+
+	if (ref > 0) {
+		luaL_unref(l, LUA_REGISTRYINDEX, ref);
+		*setting = 0;
+	}
 
 	if (!lua_isfunction(l, optindex)) {
 		snprintf(errmsg, sizeof(errmsg), "function expected, got %s", lua_typename(l, lua_type(l, optindex)));
@@ -276,7 +329,7 @@ static int json_function_option(lua_State *l, int optindex, int *setting, int na
 	}
 
 	lua_pushvalue(l, optindex);
-	int ref = luaL_ref(l, LUA_REGISTRYINDEX);
+	ref = luaL_ref(l, LUA_REGISTRYINDEX);
 	if (ref == LUA_REFNIL || ref == LUA_NOREF) {
 		luaL_error(l, "register function error, nil/no reference");
 	}
@@ -360,6 +413,8 @@ static int json_cfg_encode_use_metamethod(lua_State *l)
 	json_config_t *cfg = json_arg_init(l, 2);
 
 	json_enum_option(l, 1, &cfg->encode_use_metamethod, NULL, 1);
+	if (!cfg->encode_use_metamethod) return 1;
+
 	json_function_option(l, 2, &cfg->encode_use_metamethod_next_ref, 2);
 	if (cfg->encode_use_metamethod_next_ref < 0) {
 		cfg->encode_use_metamethod = 0;
@@ -416,6 +471,9 @@ static int json_destroy_config(lua_State *l)
     cfg = lua_touserdata(l, 1);
     if (cfg)
         strbuf_free(&cfg->encode_buf);
+    if (cfg->encode_use_metamethod_next_ref > 0) {
+    	luaL_unref(l,LUA_REGISTRYINDEX, cfg->encode_use_metamethod_next_ref);
+    }
     cfg = NULL;
 
     return 0;
@@ -446,6 +504,7 @@ static void json_create_config(lua_State *l)
     cfg->decode_null_as_nil = DEFAULT_DECODE_NULL_AS_NIL;
     cfg->encode_empty_table_as_array = DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY;
     cfg->encode_use_metamethod = DEFAULT_ENCODE_USE_METAMETHOD;
+    cfg->encode_use_metamethod_next_ref = 0;
 
 #if DEFAULT_ENCODE_KEEP_BUFFER > 0
     strbuf_init(&cfg->encode_buf, 0);
@@ -497,15 +556,22 @@ static void json_create_config(lua_State *l)
     cfg->escape2char['u'] = 'u';          /* Unicode parsing required */
 }
 
-static int json_lua_next(lua_State *l, json_config_t *cfg, int index)
+static int json_meta_next(lua_State *l, json_config_t *cfg, int index)
 {
 	if (cfg->encode_use_metamethod) {
-		/* get the custom 'next' function */
+		/* assume that the 2nd argument 'k' of next(t, k) was pushed on the top */
+
+		/* push & insert (move from top) the user 'next' function */
 		lua_rawgeti(l, LUA_REGISTRYINDEX, cfg->encode_use_metamethod_next_ref);
-		/* push the table arg */
-		lua_pushvalue(l, index);
-		/* k, v = next(t), 1 arg, 2 results */
-		lua_call(l, 1, 2);
+		lua_insert(l, -2);
+
+		/* push & insert (move from top) the 1st argument 't' of next(t, k) */
+		lua_pushvalue(l, (index > 0) ? index : index - 1);
+		lua_insert(l, -2);
+
+		/* k, v = next(t, k), 2 arg, 2 results */
+		lua_call(l, 2, 2);
+
 		/* if k is nil, pop all reaults and return 0 like lua_next() does */
 		if (lua_isnil(l, -2)) {
 			lua_pop(l, 2);
@@ -575,8 +641,7 @@ static int lua_array_length(lua_State *l, json_config_t *cfg, strbuf_t *json)
 
     lua_pushnil(l);
     /* table, startkey */
-    /*while (lua_next(l, -2) != 0) {*/
-    while (json_lua_next(l, cfg, -2) != 0) {
+    while (json_meta_next(l, cfg, -2) != 0) {
         /* table, key, value */
         if (lua_type(l, -2) == LUA_TNUMBER &&
             (k = lua_tonumber(l, -2))) {
@@ -715,8 +780,7 @@ static void json_append_object(lua_State *l, json_config_t *cfg,
     lua_pushnil(l);
     /* table, startkey */
     comma = 0;
-    /*while (lua_next(l, -2) != 0) {*/
-    while (json_lua_next(l, cfg, -2) != 0) {
+    while (json_meta_next(l, cfg, -2) != 0) {
         if (comma)
             strbuf_append_char(json, ',');
         else
